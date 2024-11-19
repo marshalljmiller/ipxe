@@ -38,6 +38,46 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 /** Equivalent of NOWHERE for user pointers */
 #define UNOWHERE ( ~UNULL )
 
+#define NOWHERE ( ~( ( EFI_PHYSICAL_ADDRESS ) 0 ) )
+
+#define MMBUF_SIZE 65536
+EFI_PHYSICAL_ADDRESS find_free_mem_block ( unsigned int num_pages ) {
+	UINTN memory_map_size = MMBUF_SIZE;
+	char mmbuf[MMBUF_SIZE];
+	EFI_MEMORY_DESCRIPTOR *memory_map = (EFI_MEMORY_DESCRIPTOR *)&mmbuf;
+	UINTN map_key;
+	UINTN descriptor_size;
+	UINT32 descriptor_version;
+	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
+	EFI_MEMORY_DESCRIPTOR *desc;
+	size_t remaining;
+	EFI_STATUS efirc;
+
+	efirc = bs->GetMemoryMap ( &memory_map_size, memory_map, &map_key,
+				   &descriptor_size, &descriptor_version );
+	if ( efirc == 0 ) {
+		DBG ( "looking for block of %x\n", num_pages);
+		for ( desc = memory_map, remaining = memory_map_size ;
+		      remaining >= descriptor_size ;
+		      desc = ( ( ( void * ) desc ) + descriptor_size ),
+		      remaining -= descriptor_size ) {
+			if (desc->Type == EfiConventionalMemory) {
+				if ((desc->Attribute & EFI_MEMORY_SP) == 0 && desc->NumberOfPages >= num_pages) {
+					DBG ( "Found free block at %llx\n", desc->PhysicalStart );
+					return desc->PhysicalStart;
+				} else {
+					DBG2 ( "Skipping conventional block %llx+%llx %llx\n", desc->PhysicalStart, desc->NumberOfPages, desc->Attribute);
+				}
+			} else {
+				DBG2 ( "Skipping other block %llx+%llx %llx\n", desc->PhysicalStart, desc->NumberOfPages, desc->Attribute);
+			}
+		}
+	} else {
+		DBG ( "Failed to get memory map\n" );
+	}
+	return NOWHERE;
+}
+
 /**
  * Reallocate external memory
  *
@@ -51,6 +91,7 @@ FILE_LICENCE ( GPL2_OR_LATER_OR_UBDL );
 static userptr_t efi_urealloc ( userptr_t old_ptr, size_t new_size ) {
 	EFI_BOOT_SERVICES *bs = efi_systab->BootServices;
 	EFI_PHYSICAL_ADDRESS phys_addr;
+	EFI_ALLOCATE_TYPE alloc_type;
 	unsigned int new_pages, old_pages;
 	userptr_t new_ptr = UNOWHERE;
 	size_t old_size;
@@ -62,7 +103,15 @@ static userptr_t efi_urealloc ( userptr_t old_ptr, size_t new_size ) {
 	 */
 	if ( new_size ) {
 		new_pages = ( EFI_SIZE_TO_PAGES ( new_size ) + 1 );
-		if ( ( efirc = bs->AllocatePages ( AllocateAnyPages,
+		alloc_type = AllocateAddress;
+		phys_addr = find_free_mem_block( new_pages );
+		if (phys_addr == NOWHERE) {
+			DBG ( "Unable to find memory block with %d pages free. Falling back to AllocateAnyPages.\n", new_pages );
+			alloc_type = AllocateAnyPages;
+		} else {
+			DBG ( "Found free memory block at %llx.\n", phys_addr);
+		}
+		if ( ( efirc = bs->AllocatePages ( alloc_type,
 						   EfiBootServicesData,
 						   new_pages,
 						   &phys_addr ) ) != 0 ) {
